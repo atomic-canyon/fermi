@@ -1,0 +1,4 @@
+venv
+beir_log.jsonl
+src/beir_cache
+__pycache__
