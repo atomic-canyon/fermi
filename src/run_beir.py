@@ -78,13 +78,13 @@ def flatten_chunks(ds):
     ds = ds.map(_flatten_chunks, batched=True, remove_columns=ds.column_names, batch_size=1, num_proc=NUM_PROC, desc='flattening chunks')
     return ds
 
-def chunk_dataset_llamaindex_sentence(ds, tokenizer_model="bert-base-uncased", max_tokens=512, token_overlap=64):
+def chunk_dataset_llamaindex_sentence(ds, tokenizer_model="bert-base-uncased", max_tokens=512, token_overlap=64, paragraph_separator='\n\n'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_model)
     splitter = SentenceSplitter(
         chunk_size=max_tokens,
         chunk_overlap=token_overlap,
         tokenizer=tokenizer.tokenize,
-        paragraph_separator="\n\n"
+        paragraph_separator=paragraph_separator,
     )
     def chunkit(example, **kw):
         return dict(text=splitter.split_text(example['text']))
@@ -93,22 +93,44 @@ def chunk_dataset_llamaindex_sentence(ds, tokenizer_model="bert-base-uncased", m
         chunkit,
         num_proc=NUM_PROC,
         desc='chunking docs',
-        fn_kwargs=dict(tokenizer_model=tokenizer_model, max_tokens=max_tokens, token_overlap=token_overlap),
+        fn_kwargs=dict(tokenizer_model=tokenizer_model, max_tokens=max_tokens, token_overlap=token_overlap, paragraph_separator=paragraph_separator),
     )
+
+_special_token_ids = {} #cache
+def _get_special_token_id_mask(tokenizer_name, device='cpu'):
+    cache_key = (tokenizer_name, device)
+    if cache_key in _special_token_ids:
+        return _special_token_ids[cache_key]
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+    vocab = tokenizer.vocab
+    vocab_size = len(vocab)
+
+    special_token_ids = [
+        vocab[token]
+        for token in tokenizer.special_tokens_map.values()
+        if isinstance(token, str)
+    ]
+
+    # construct the boolean mask, true for non-special tokens, false for special
+    mask = torch.ones(vocab_size, dtype=torch.bool)
+    mask[special_token_ids] = False
+
+    # move the mask to the GPU or whatever
+    mask = mask.to(device).detach()
+
+    _special_token_ids[cache_key] = mask
+    return mask
 
 _special_token_ids = {} #cache special token ids
 def _get_sparse_vector(tokenizer, feature, output):
     #get special token ids
     tokenizer_name = tokenizer if isinstance(tokenizer, str) else tokenizer.name_or_path
-    st_ids = _special_token_ids.get(tokenizer_name)
-    if st_ids is None:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-        st_ids = [tokenizer.vocab[token] for token in tokenizer.special_tokens_map.values() if type(token) == str]
-        _special_token_ids[tokenizer_name] = st_ids
+    special_token_ids = _get_special_token_id_mask(tokenizer_name, device=output.device.type)
     #get sparse vector in dense format
     values, _ = torch.max(output*feature["attention_mask"].unsqueeze(-1), dim=1)
-    values = torch.log(1 + torch.relu(values))
-    values[:,st_ids] = 0 #zero out special tokens
+    values = torch.log1p(torch.relu(values))
+    values *= special_token_ids.unsqueeze(0)
     return values
 
 def sparse_embed(model, tokenizer, texts):
@@ -126,7 +148,7 @@ def sparse_embed_dataset(ds, model, tokenizer):
                   batched=True, batch_size=GPU_BATCH_SIZE, num_proc=1, desc=f'computing sparse embeddings')
 
 class SparseSearchAdapter(BaseSearch):
-    def __init__(self, model, tokenizer, rerank_model=None, sparse_index_dir=None, compute_flops=True, do_chunking=True, max_tokens=512):
+    def __init__(self, model, tokenizer, rerank_model=None, sparse_index_dir=None, compute_flops=True, do_chunking=True, max_tokens=512, token_overlap=64, paragraph_separator='\n\n'):
         self.model = model
         self.tokenizer = tokenizer
         self.rerank_model = rerank_model
@@ -136,11 +158,14 @@ class SparseSearchAdapter(BaseSearch):
         self.do_chunking = do_chunking
         self.compute_flops = compute_flops
         self.max_tokens = max_tokens
+        self.paragraph_separator = paragraph_separator
+        self.token_overlap = token_overlap
         self.doc_sparsity_dist = collections.Counter() # used to store sparsity stats and compute flops
         self.query_sparsity_dist = collections.Counter() # used to store sparsity stats and compute flops
         self.flops = None #if compute_flops is set, this will be populated
         self.avg_query_sparsity = None
         self.avg_doc_sparsity = None
+        self.total_num_embeddings = 0
         self.results = {}
 
     def search(self,
@@ -159,7 +184,8 @@ class SparseSearchAdapter(BaseSearch):
             # token_overlap is a magic number, chosen without much thought, but must be consistent
             doc_ds = chunk_dataset_llamaindex_sentence(
                 doc_ds, tokenizer_model=self.tokenizer,
-                max_tokens=self.max_tokens, token_overlap=64
+                max_tokens=self.max_tokens, token_overlap=self.token_overlap,
+                paragraph_separator=self.paragraph_separator,
             )
             doc_ds = flatten_chunks(doc_ds)
 
@@ -167,6 +193,7 @@ class SparseSearchAdapter(BaseSearch):
         model.to(device)
         model.eval()
         doc_ds = sparse_embed_dataset(doc_ds, model, tokenizer)
+        self.total_num_embeddings = len(doc_ds)
         logger.info("Embedding compute complete.")
 
         if self.compute_flops:
@@ -258,6 +285,8 @@ def main():
     parser.add_argument('--no-chunking', action='store_true', help='Disable chunking of long documents')
     parser.add_argument('--no-flops', action='store_true', help='Disable computing flops / sparsity stats')
     parser.add_argument('--max-tokens', type=int, default=512, help='Max supported length for embedding model')
+    parser.add_argument('--token-overlap', type=int, default=48, help='Overlap between different chunks')
+    parser.add_argument('--paragraph-separator', type=str, default='\n\n', help='String to use as paragraph separator')
     args = parser.parse_args()
     args.tokenizer = args.tokenizer or args.model
 
@@ -306,7 +335,9 @@ def main():
         sparse_index_dir=args.sparse_index_dir,
         max_tokens=args.max_tokens,
         compute_flops=not args.no_flops,
-        do_chunking=not args.no_chunking
+        do_chunking=not args.no_chunking,
+        token_overlap=args.token_overlap,
+        paragraph_separator=args.paragraph_separator,
     )
 
     # retrieve the results for each query in the dataset
@@ -331,6 +362,7 @@ def main():
         flops=model.flops if not args.no_flops else None,
         avg_doc_sparsity=model.avg_doc_sparsity,
         avg_query_sparsity=model.avg_query_sparsity,
+        total_num_embeddings=model.total_num_embeddings,
     ))
     print(res_json)
     with open(args.jsonl_log, 'a') as file:
