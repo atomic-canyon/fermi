@@ -7,9 +7,9 @@ from datetime import datetime
 from decouple import config
 from huggingface_hub import snapshot_download
 from llama_index.core.text_splitter import SentenceSplitter
-from pyserini.search.lucene import LuceneImpactSearcher
 from sentence_transformers import CrossEncoder
-from sparse_embeddings import create_sparse_index, output_to_weight_dicts, get_encoded_query_token_weight_dicts, lookup_sparse_collection_text
+from sparse_embeddings import output_to_weight_dicts
+from milvus_sparse import create_milvus_sparse_index, MilvusImpactSearcher, lookup_milvus_collection_text
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 from typing import Dict, List, Tuple
@@ -207,7 +207,8 @@ class SparseSearchAdapter(BaseSearch):
             doc_ds_sample = doc_ds.shuffle().select(range(sample_size))
             doc_ds_sample.filter(_compute_stats, num_proc=1, desc='compute sparsity stats')
 
-        lucene_index_path = create_sparse_index(doc_ds, self.tokenizer, text_key='text', save_text=bool(self.rerank_model), save_dir=self.sparse_index_dir)
+        collection_name = f"sparse_docs_{abs(hash(str(sorted(corpus.keys()))))}"
+        create_milvus_sparse_index(doc_ds, self.tokenizer, text_key='text', collection_name=collection_name)
 
         rerank_model = None
         if self.rerank_model:
@@ -216,25 +217,23 @@ class SparseSearchAdapter(BaseSearch):
             rerank_model.model.to(device)
             rerank_model.model.eval()
 
-        query_sparsity_dist = self.query_sparsity_dist if self.compute_flops else None
-        class QueryEncoder():
-            def encode(self, texts, **kwargs):
-                ret = sparse_embed(model, tokenizer, texts)
-                ret = output_to_weight_dicts(ret, reverse_voc)
-                if query_sparsity_dist is not None: #compute sparsity stats if needed
-                    for vec in ret:
-                        for k, v in vec.items():
-                            query_sparsity_dist[k] += 1
-                ret = get_encoded_query_token_weight_dicts(ret)[0]
-                return ret
+        # Query encoding now handled by MilvusImpactSearcher internally
 
-        searcher = LuceneImpactSearcher(lucene_index_path, QueryEncoder())
+        searcher = MilvusImpactSearcher(collection_name, self.tokenizer)
         for qid, query in tqdm(queries.items(), desc='searching queries'):
             # this section increases k to implement score-max https://arxiv.org/pdf/2305.18494
             # by default bier's EvaluateRetrieval.retrieve() passes top_k = 1000
             hits = searcher.search(query, k=top_k*2)
+            
+            # Compute sparsity stats if needed for compatibility
+            if self.compute_flops:
+                query_embeddings = searcher.splade_ef.encode_queries([query])
+                # Convert CSR sparse array to dict format for sparsity computation
+                query_sparse = {int(idx): float(val) for idx, val in zip(query_embeddings.indices, query_embeddings.data)}
+                for k, v in query_sparse.items():
+                    self.query_sparsity_dist[k] += 1
             if rerank_model:
-                scores = rerank_model.predict([(query, lookup_sparse_collection_text(lucene_index_path, hit.docid)) for hit in hits], batch_size=GPU_BATCH_SIZE, show_progress_bar=False)
+                scores = rerank_model.predict([(query, lookup_milvus_collection_text(collection_name, hit.docid)) for hit in hits], batch_size=GPU_BATCH_SIZE, show_progress_bar=False)
                 for hit, score in zip(hits, scores):
                     hit.score = score #overwrite the score with the rerank score
 
