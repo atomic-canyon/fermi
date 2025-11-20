@@ -133,8 +133,8 @@ def _get_sparse_vector(tokenizer, feature, output):
     values *= special_token_ids.unsqueeze(0)
     return values
 
-def sparse_embed(model, tokenizer, texts):
-    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+def sparse_embed(model, tokenizer, texts, max_length=None):
+    inputs = tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     inputs.to(device)
     with torch.no_grad():
         if 'token_type_ids' in inputs: del inputs['token_type_ids']
@@ -143,9 +143,9 @@ def sparse_embed(model, tokenizer, texts):
         embeddings = embeddings.cpu().detach()
     return [r.numpy() for r in embeddings]
 
-def sparse_embed_dataset(ds, model, tokenizer):
-    return ds.map(lambda batch: {'embeddings': sparse_embed(model, tokenizer, batch['text'])},
-                  batched=True, batch_size=GPU_BATCH_SIZE, num_proc=1, desc=f'computing sparse embeddings')
+def sparse_embed_dataset(ds, model, tokenizer, max_length=None):
+    return ds.map(lambda batch: {'embeddings': sparse_embed(model, tokenizer, batch['text'], max_length=max_length)},
+                  batched=True, batch_size=GPU_BATCH_SIZE, num_proc=None, desc=f'computing sparse embeddings')
 
 class SparseSearchAdapter(BaseSearch):
     def __init__(self, model, tokenizer, rerank_model=None, sparse_index_dir=None, compute_flops=True, do_chunking=True, max_tokens=512, token_overlap=64, paragraph_separator='\n\n'):
@@ -192,7 +192,7 @@ class SparseSearchAdapter(BaseSearch):
         logger.info("Starting embedding compute...")
         model.to(device)
         model.eval()
-        doc_ds = sparse_embed_dataset(doc_ds, model, tokenizer)
+        doc_ds = sparse_embed_dataset(doc_ds, model, tokenizer, max_length=self.max_tokens)
         self.total_num_embeddings = len(doc_ds)
         logger.info("Embedding compute complete.")
 
@@ -205,7 +205,7 @@ class SparseSearchAdapter(BaseSearch):
                 return
             sample_size = min(doc_ds.num_rows, 10_000)
             doc_ds_sample = doc_ds.shuffle().select(range(sample_size))
-            doc_ds_sample.filter(_compute_stats, num_proc=1, desc='compute sparsity stats')
+            doc_ds_sample.filter(_compute_stats, num_proc=None, desc='compute sparsity stats')
 
         lucene_index_path = create_sparse_index(doc_ds, self.tokenizer, text_key='text', save_text=bool(self.rerank_model), save_dir=self.sparse_index_dir)
 
@@ -217,9 +217,10 @@ class SparseSearchAdapter(BaseSearch):
             rerank_model.model.eval()
 
         query_sparsity_dist = self.query_sparsity_dist if self.compute_flops else None
+        max_tokens = self.max_tokens
         class QueryEncoder():
             def encode(self, texts, **kwargs):
-                ret = sparse_embed(model, tokenizer, texts)
+                ret = sparse_embed(model, tokenizer, texts, max_length=max_tokens)
                 ret = output_to_weight_dicts(ret, reverse_voc)
                 if query_sparsity_dist is not None: #compute sparsity stats if needed
                     for vec in ret:

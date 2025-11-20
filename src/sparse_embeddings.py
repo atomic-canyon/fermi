@@ -44,14 +44,19 @@ def get_encoded_query_token_weight_dicts(tok_weights, scale_factor=50.0, max_ter
     for _tok_weight in tok_weights:
         _weights = {}
         for token, weight in _tok_weight.items():
+            # Check for NaN values and skip them
+            if np.isnan(weight):
+                logger.debug(f"Skipping token '{token}' with NaN weight")
+                continue
             weight_quanted = round(weight * scale_factor)
-            if weight_quanted == 0: continue #skip zero weights
+            if weight_quanted == 0: 
+                continue  # skip zero weights
             _weights[token] = weight_quanted
         if len(_weights.keys()) > max_terms:
             _weights = list(_weights.items())
             logger.warn(f"WARNING: number of terms {len(_weights)} exceeds 1024, truncating to 1024")
             _weights.sort(key=lambda x: x[1], reverse=True)
-            _weights = _weights[:max_terms] #pyserini will fail if total is over 1024
+            _weights = _weights[:max_terms]  # pyserini will fail if total is over 1024
         assert len(_weights) <= max_terms, f"total: {len(_weights)} exceeds 1024 it is going to fail in pyserini {_weights}"
         _weights = dict(_weights)
         to_return.append(_weights)
